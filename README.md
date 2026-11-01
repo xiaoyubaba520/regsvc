@@ -1,0 +1,2 @@
+# regsvc
+probe registry service

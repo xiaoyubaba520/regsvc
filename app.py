@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-最小 Docker Registry v2 —— 适配 Ollama pull
-关键：blob 端点返回 302 + Location，或 200 + 完整内容
+最小 Docker Registry v2 —— blob 直接 200 返回内容
 """
 import hashlib
 import json
 import os
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
@@ -26,10 +24,7 @@ CONFIG_BLOB = json.dumps({
 H_MODEL = hashlib.sha256(MODEL_BLOB).hexdigest()
 H_CONFIG = hashlib.sha256(CONFIG_BLOB).hexdigest()
 
-BLOBS = {
-    H_MODEL: MODEL_BLOB,
-    H_CONFIG: CONFIG_BLOB,
-}
+BLOBS = {H_MODEL: MODEL_BLOB, H_CONFIG: CONFIG_BLOB}
 
 MANIFEST = {
     "schemaVersion": 2,
@@ -48,12 +43,10 @@ MANIFEST = {
     ],
 }
 
-BASE = os.environ.get("PUBLIC_BASE", "https://regsvc.orkestr.run")
-
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "registry", "base": BASE}
+    return {"status": "ok", "blobs": list(BLOBS.keys())}
 
 
 @app.get("/v2/")
@@ -69,7 +62,10 @@ def manifest(ns: str, repo: str, tag: str):
     return Response(
         content=body,
         media_type="application/vnd.docker.distribution.manifest.v2+json",
-        headers={"Docker-Content-Digest": dg},
+        headers={
+            "Docker-Content-Digest": dg,
+            "Content-Length": str(len(body)),
+        },
     )
 
 
@@ -77,21 +73,9 @@ def manifest(ns: str, repo: str, tag: str):
 def blob(ns: str, repo: str, digest: str, request: Request):
     key = digest.replace("sha256:", "").split("/")[-1]
     data = BLOBS.get(key) or MODEL_BLOB
-    # 302 到自身的内容端点（Ollama 期望 Location）
     if request.method == "HEAD":
-        return Response(
-            status_code=307,
-            headers={"Location": f"{BASE}/content/{key}",
-                     "Content-Length": "0"},
-        )
-    return Response(
-        status_code=307,
-        headers={"Location": f"{BASE}/content/{key}"},
-    )
-
-
-@app.api_route("/content/{key}", methods=["GET", "HEAD"])
-def content(key: str):
-    data = BLOBS.get(key) or MODEL_BLOB
+        return Response(status_code=200,
+                        media_type="application/octet-stream",
+                        headers={"Content-Length": str(len(data))})
     return Response(content=data, media_type="application/octet-stream",
                     headers={"Content-Length": str(len(data))})

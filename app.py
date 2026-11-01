@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""registry + 请求日志"""
+"""registry：307 + Location，并记录日志"""
 import hashlib
 import json
-import os
 import time
 
 from fastapi import FastAPI, Request, Response
@@ -21,6 +20,8 @@ H_MODEL = hashlib.sha256(MODEL_BLOB).hexdigest()
 H_CONFIG = hashlib.sha256(CONFIG_BLOB).hexdigest()
 BLOBS = {H_MODEL: MODEL_BLOB, H_CONFIG: CONFIG_BLOB}
 
+BASE = "https://regsvc.orkestr.run"
+
 MANIFEST = {
     "schemaVersion": 2,
     "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
@@ -37,35 +38,18 @@ MANIFEST = {
 }
 
 
-def log(method, path, ua, extra=""):
-    LOGS.append({"t": time.time(), "m": method, "p": path,
-                 "ua": (ua or "")[:60], "x": extra})
-    if len(LOGS) > 500:
-        del LOGS[:100]
-
-
 @app.middleware("http")
 async def mw(request: Request, call_next):
-    log(request.method, request.url.path,
-        request.headers.get("user-agent", ""),
-        "range=" + request.headers.get("range", ""))
+    LOGS.append({"m": request.method, "p": request.url.path[:120],
+                 "ua": (request.headers.get("user-agent") or "")[:40]})
+    if len(LOGS) > 300:
+        del LOGS[:80]
     return await call_next(request)
 
 
 @app.get("/logs")
 def logs():
-    return {"n": len(LOGS), "logs": LOGS[-120:]}
-
-
-@app.post("/logs/clear")
-def clear():
-    LOGS.clear()
-    return {"ok": True}
-
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
+    return {"n": len(LOGS), "logs": LOGS[-80:]}
 
 
 @app.get("/v2/")
@@ -78,20 +62,29 @@ def v2():
 def manifest(ns: str, repo: str, tag: str, request: Request):
     body = json.dumps(MANIFEST)
     dg = "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+    hdr = {"Docker-Content-Digest": dg, "Content-Length": str(len(body))}
     if request.method == "HEAD":
         return Response(status_code=200,
                         media_type="application/vnd.docker.distribution.manifest.v2+json",
-                        headers={"Docker-Content-Digest": dg,
-                                 "Content-Length": str(len(body))})
+                        headers=hdr)
     return Response(content=body,
                     media_type="application/vnd.docker.distribution.manifest.v2+json",
-                    headers={"Docker-Content-Digest": dg,
-                             "Content-Length": str(len(body))})
+                    headers=hdr)
 
 
 @app.api_route("/v2/{ns}/{repo}/blobs/{digest:path}", methods=["GET", "HEAD"])
 def blob(ns: str, repo: str, digest: str, request: Request):
     key = digest.replace("sha256:", "").split("/")[-1]
+    data = BLOBS.get(key) or MODEL_BLOB
+    loc = BASE + "/content/" + key
+    # 一律 307 + Location
+    return Response(status_code=307,
+                    headers={"Location": loc,
+                             "Content-Length": "0"})
+
+
+@app.api_route("/content/{key}", methods=["GET", "HEAD"])
+def content(key: str, request: Request):
     data = BLOBS.get(key) or MODEL_BLOB
     if request.method == "HEAD":
         return Response(status_code=200,
